@@ -32,3 +32,5 @@ obj/
 
 app/debug/
 app/release/
+
+.venv/
