@@ -27,12 +27,9 @@ class VadEngine(
         private const val WINDOW_SIZE = 256
         private const val STATE_DIM = 128
         private const val STATE_LAYERS = 2
-        private const val SPEECH_THRESHOLD = 0.08f
-        private const val STRONG_SPEECH_PROBABILITY = 0.6f
-        private const val LOUD_INPUT_RMS = 0.08f
-        private const val MIN_VOICED_PEAK_CONTRAST = 0.2f
-        private const val SPEECH_CONFIRM_MILLIS = 64L
-        private const val SPEECH_RELEASE_MILLIS = 400L
+        private const val SPEECH_THRESHOLD = 0.10f
+        private const val SPEECH_CONFIRM_MILLIS = 32L
+        private const val SPEECH_RELEASE_MILLIS = 850L
         private const val TARGET_MODEL_INPUT_RMS = 0.08f
         private const val MAX_INPUT_GAIN = 32f
         private const val GAIN_ATTACK = 0.5f
@@ -249,8 +246,6 @@ class VadEngine(
                 val rms = kotlin.math.sqrt(sumSquares / WINDOW_SIZE).toFloat()
                 onAudioLevelUpdated?.invoke(rms)
 
-                val voicedPeakContrast = periodicSpeechScore(floatBuffer)
-
                 // Adapt quiet microphone input to the model's useful range without gating frames.
                 val desiredGain = (TARGET_MODEL_INPUT_RMS / rms.coerceAtLeast(1e-8f))
                     .coerceIn(1f, MAX_INPUT_GAIN)
@@ -282,11 +277,7 @@ class VadEngine(
 
                 val frameMillis = WINDOW_SIZE * 1_000L / SAMPLE_RATE
 
-                val loudUnvoicedNoise = !lastSpeechState &&
-                    rms >= LOUD_INPUT_RMS &&
-                    probability < STRONG_SPEECH_PROBABILITY &&
-                    voicedPeakContrast < MIN_VOICED_PEAK_CONTRAST
-                val speechCandidate = probability >= SPEECH_THRESHOLD && !loudUnvoicedNoise
+                val speechCandidate = probability >= SPEECH_THRESHOLD
 
                 if (speechCandidate) {
                     speechMillis += frameMillis
@@ -325,48 +316,6 @@ class VadEngine(
             srTensor?.close()
             if (lastSpeechState) onSpeechStateChanged(false)
         }
-    }
-
-    private fun periodicSpeechScore(samples: FloatArray): Float {
-        val highPassed = FloatArray(samples.size)
-        var previous = samples[0]
-        for (i in samples.indices) {
-            val current = samples[i]
-            highPassed[i] = current - previous
-            previous = current
-        }
-
-        val correlations = DoubleArray(SAMPLE_RATE / 80 - SAMPLE_RATE / 360 + 1)
-        val minLag = SAMPLE_RATE / 360
-        for (lag in minLag until minLag + correlations.size) {
-            var correlation = 0.0
-            var firstEnergy = 0.0
-            var secondEnergy = 0.0
-            for (i in lag until highPassed.size) {
-                val first = highPassed[i]
-                val second = highPassed[i - lag]
-                correlation += first * second
-                firstEnergy += first * first
-                secondEnergy += second * second
-            }
-            val denominator = kotlin.math.sqrt(firstEnergy * secondEnergy)
-            if (denominator > 1e-12) {
-                correlations[lag - minLag] = correlation / denominator
-            }
-        }
-
-        val peakIndex = correlations.indices.maxByOrNull { correlations[it] } ?: return 0f
-        val peak = correlations[peakIndex]
-        var neighborSum = 0.0
-        var neighborCount = 0
-        for (index in maxOf(0, peakIndex - 5)..minOf(correlations.lastIndex, peakIndex + 5)) {
-            if (kotlin.math.abs(index - peakIndex) > 1) {
-                neighborSum += correlations[index]
-                neighborCount++
-            }
-        }
-        if (neighborCount == 0) return 0f
-        return (peak - neighborSum / neighborCount).toFloat()
     }
 
     private fun runInference(
