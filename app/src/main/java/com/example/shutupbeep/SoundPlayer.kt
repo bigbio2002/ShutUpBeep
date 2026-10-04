@@ -4,19 +4,17 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import android.util.Log
+import kotlin.math.sin
 
 /**
- * High-performance, zero-latency tone generator using a static looping [AudioTrack].
- *
- * When initialized, a seamless square-wave cycle is loaded into memory and kept active in the audio mixer
- * at zero volume. Un-muting and muting takes effect in the very next audio mixer period (<5ms),
- * eliminating any track startup or thread-scheduling delay when speech is detected.
+ * High-performance, zero-latency streaming tone generator using [AudioTrack] in [AudioTrack.MODE_STREAM].
+ * Routes tone audio through [AudioAttributes.USAGE_MEDIA] for universal device volume compatibility.
  */
 class SoundPlayer {
     companion object {
         private const val TAG = "SoundPlayer"
         private const val SAMPLE_RATE = 48_000
-        private const val FREQUENCY_HZ = 880.0 // A5 harsh square wave
+        const val TONE_FREQUENCY_HZ = 1000.0 // 1 kHz loud tone
         private const val AMPLITUDE = 0.95f
     }
 
@@ -26,32 +24,26 @@ class SoundPlayer {
     private var isPrepared = false
 
     @Volatile
-    private var isTonePlaying = false
+    private var isPlaying = false
+
+    @Volatile
+    private var playerThread: Thread? = null
 
     @Synchronized
     fun prepare() {
         if (isPrepared) return
         try {
-            // Generate seamless looping buffer
-            // 48000 / 880 = 600 / 11 -> exactly 880 cycles in 48000 samples (1 full second)
-            val numSamples = SAMPLE_RATE
-            val buffer = ShortArray(numSamples)
-            val periodSamples = SAMPLE_RATE / FREQUENCY_HZ
-            val ampValue = (AMPLITUDE * Short.MAX_VALUE).toInt().toShort()
-            val negAmpValue = (-AMPLITUDE * Short.MAX_VALUE).toInt().toShort()
-
-            for (i in 0 until numSamples) {
-                val phase = (i % periodSamples) / periodSamples
-                buffer[i] = if (phase < 0.5) ampValue else negAmpValue
-            }
-
-            val bufferSizeInBytes = numSamples * 2
+            val minBufSize = AudioTrack.getMinBufferSize(
+                SAMPLE_RATE,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+            ).coerceAtLeast(4800)
 
             val track = AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                         .build()
                 )
                 .setAudioFormat(
@@ -61,63 +53,77 @@ class SoundPlayer {
                         .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                         .build()
                 )
-                .setBufferSizeInBytes(bufferSizeInBytes)
-                .setTransferMode(AudioTrack.MODE_STATIC)
+                .setBufferSizeInBytes(minBufSize)
+                .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
-
-            val written = track.write(buffer, 0, numSamples)
-            if (written != numSamples) {
-                Log.w(TAG, "AudioTrack wrote $written of $numSamples samples")
-            }
-
-            track.setLoopPoints(0, numSamples, -1) // Loop infinitely
-            track.setVolume(0.0f) // Start muted
-            track.play()
 
             audioTrack = track
             isPrepared = true
-            isTonePlaying = false
-            Log.d(TAG, "SoundPlayer primed and standing by (muted)")
+            isPlaying = false
+
+            playerThread = Thread(::playbackLoop, "sound-player-thread").also { it.start() }
+            Log.d(TAG, "SoundPlayer primed and standing by")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to prepare SoundPlayer", e)
         }
     }
 
     /**
-     * Instantly mutes or un-mutes the tone.
-     * Safe to call from any thread (e.g. directly from audio recording thread).
+     * Instantly mutes or un-mutes the tone output.
      */
     fun setToneActive(active: Boolean) {
-        if (isTonePlaying == active) return
-        isTonePlaying = active
-        val track = audioTrack ?: return
+        if (isPlaying == active) return
+        isPlaying = active
+        Log.d(TAG, "setToneActive: $active")
+    }
+
+    private fun playbackLoop() {
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+
+        val chunkSize = 480 // 10ms chunks at 48kHz
+        val pcmBuffer = ShortArray(chunkSize)
+        val ampValue = (AMPLITUDE * Short.MAX_VALUE).toInt().toShort()
+        val negAmpValue = (-AMPLITUDE * Short.MAX_VALUE).toInt().toShort()
+
+        var sampleIndex = 0L
 
         try {
-            if (active) {
-                track.setVolume(1.0f)
-            } else {
-                track.setVolume(0.0f)
+            val track = audioTrack ?: return
+            track.play()
+
+            while (isPrepared) {
+                if (isPlaying) {
+                    for (i in 0 until chunkSize) {
+                        val phase = (2.0 * Math.PI * TONE_FREQUENCY_HZ * sampleIndex) / SAMPLE_RATE
+                        pcmBuffer[i] = if (sin(phase) >= 0) ampValue else negAmpValue
+                        sampleIndex++
+                    }
+                    track.write(pcmBuffer, 0, chunkSize)
+                } else {
+                    sampleIndex = 0L
+                    Thread.sleep(10)
+                }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error setting volume in SoundPlayer", e)
+            Log.e(TAG, "Error in SoundPlayer playback loop", e)
         }
     }
 
     @Synchronized
     fun release() {
-        setToneActive(false)
         isPrepared = false
-        audioTrack?.let { track ->
-            try {
-                track.stop()
-            } catch (e: Exception) {
-                Log.w(TAG, "Error stopping AudioTrack", e)
-            }
-            try {
-                track.release()
-            } catch (e: Exception) {
-                Log.w(TAG, "Error releasing AudioTrack", e)
-            }
+        isPlaying = false
+
+        try {
+            playerThread?.join(500)
+        } catch (_: Exception) {}
+        playerThread = null
+
+        try {
+            audioTrack?.stop()
+            audioTrack?.release()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error releasing AudioTrack", e)
         }
         audioTrack = null
         Log.d(TAG, "SoundPlayer released")

@@ -29,3 +29,6 @@ obj/
 *.jks
 
 #.cxx
+
+app/debug/
+app/release/

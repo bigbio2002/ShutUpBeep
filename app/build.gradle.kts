@@ -8,7 +8,7 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.example.shutupbeep"
+        applicationId = "com.verdictisout.shutupbeep"
         minSdk = 28
         targetSdk = 35
         versionCode = 1
@@ -40,6 +40,7 @@ android {
     androidResources {
         noCompress += listOf("onnx")
     }
+    buildToolsVersion = "36.0.0"
 }
 
 dependencies {

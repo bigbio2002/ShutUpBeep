@@ -3,38 +3,48 @@ package com.example.shutupbeep
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
+import android.media.AudioManager
 import android.content.Context
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
 import android.util.Log
 import java.nio.FloatBuffer
 import java.nio.LongBuffer
 
 class VadEngine(
     private val context: Context,
-    @Volatile var speechThreshold: Float = 0.5f,
+    private val onListeningStarted: () -> Unit,
     private val onSpeechStateChanged: (isSpeech: Boolean) -> Unit,
+    private val onError: (message: String) -> Unit,
+    private val onProbabilityUpdated: ((Float) -> Unit)? = null,
+    private val onAudioLevelUpdated: ((Float) -> Unit)? = null,
 ) {
     companion object {
         private const val TAG = "VadEngine"
         private const val SAMPLE_RATE = 16_000
-        private const val WINDOW_SIZE = 512 // 32ms at 16kHz
+        private const val WINDOW_SIZE = 256
         private const val STATE_DIM = 128
         private const val STATE_LAYERS = 2
+        private const val SPEECH_THRESHOLD = 0.08f
+        private const val STRONG_SPEECH_PROBABILITY = 0.6f
+        private const val LOUD_INPUT_RMS = 0.08f
+        private const val MIN_VOICED_PEAK_CONTRAST = 0.2f
+        private const val SPEECH_CONFIRM_MILLIS = 64L
+        private const val SPEECH_RELEASE_MILLIS = 400L
+        private const val TARGET_MODEL_INPUT_RMS = 0.08f
+        private const val MAX_INPUT_GAIN = 32f
+        private const val GAIN_ATTACK = 0.5f
+        private const val GAIN_RELEASE = 0.15f
     }
 
-    private var ortEnv: OrtEnvironment? = null
+    @Volatile
     private var ortSession: OrtSession? = null
 
-    private val state = FloatArray(STATE_LAYERS * 1 * STATE_DIM)
-
+    @Volatile
     private var audioRecord: AudioRecord? = null
-    private val minBufferSize = AudioRecord.getMinBufferSize(
-        SAMPLE_RATE,
-        AudioFormat.CHANNEL_IN_MONO,
-        AudioFormat.ENCODING_PCM_16BIT,
-    ).coerceAtLeast(WINDOW_SIZE * 2 * 4)
+    private var acousticEchoCanceler: AcousticEchoCanceler? = null
 
     @Volatile
     private var isRunning = false
@@ -43,157 +53,362 @@ class VadEngine(
     fun start() {
         if (isRunning) return
         isRunning = true
-        state.fill(0f)
+        recordingThread = Thread(::initializeAndRecord, "silero-vad-thread").also { it.start() }
+    }
 
+    private fun initializeAndRecord() {
         try {
             val modelBytes = context.assets.open("silero_vad.onnx").use { it.readBytes() }
-            val env = OrtEnvironment.getEnvironment()
-            val session = env.createSession(modelBytes, OrtSession.SessionOptions())
-            ortEnv = env
+            val session = OrtEnvironment.getEnvironment().createSession(
+                modelBytes,
+                OrtSession.SessionOptions(),
+            )
             ortSession = session
 
-            Log.d(TAG, "ONNX session created. Inputs: ${session.inputNames}, Outputs: ${session.outputNames}")
+            Log.d(TAG, "Silero VAD session ready. Inputs=${session.inputNames}, outputs=${session.outputNames}")
+            check(session.inputNames.containsAll(listOf("input", "state", "sr"))) {
+                "Unexpected Silero VAD model inputs: ${session.inputNames}"
+            }
+            check(session.outputNames.containsAll(listOf("output", "stateN"))) {
+                "Unexpected Silero VAD model outputs: ${session.outputNames}"
+            }
+            check(isRunning) { "Speech detection was stopped during initialization" }
 
-            val record = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
-                SAMPLE_RATE,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                minBufferSize,
-            )
+            val record = createAudioRecord()
+            audioRecord = record
+            enableEchoCancellation(record)
 
-            if (record.state != AudioRecord.STATE_INITIALIZED) {
-                Log.e(TAG, "AudioRecord failed to initialize")
-                record.release()
-                stop()
-                return
+            check(isRunning) { "Speech detection was stopped during initialization" }
+            record.startRecording()
+            if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                throw IllegalStateException("Microphone did not start recording")
             }
 
-            audioRecord = record
-            record.startRecording()
-            Log.d(TAG, "AudioRecord started, state=${record.recordingState}")
+            Log.i(TAG, "Microphone recording started at ${SAMPLE_RATE}Hz")
+            if (!isRunning) return
+            onListeningStarted()
+            recordingLoop()
+        } catch (e: Exception) {
+            if (isRunning) {
+                Log.e(TAG, "Failed to run Silero VAD", e)
+                onError(e.message ?: "Unable to start speech detection")
+            }
+        } finally {
+            isRunning = false
+            cleanup()
+        }
+    }
 
-            recordingThread = Thread(::recordingLoop, "vad-recording-thread").also {
-                it.start()
+    private fun createAudioRecord(): AudioRecord {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val supportsUnprocessed = audioManager
+            .getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true"
+        val audioSource = if (supportsUnprocessed) {
+            MediaRecorder.AudioSource.UNPROCESSED
+        } else {
+            MediaRecorder.AudioSource.VOICE_RECOGNITION
+        }
+        val minimumBufferSize = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+        )
+        check(minimumBufferSize > 0) {
+            "Device does not support 16 kHz mono microphone capture (error $minimumBufferSize)"
+        }
+
+        val record = AudioRecord(
+            audioSource,
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            maxOf(minimumBufferSize, WINDOW_SIZE * 2 * 4),
+        )
+        if (record.state != AudioRecord.STATE_INITIALIZED) {
+            record.release()
+            throw IllegalStateException("Microphone recorder failed to initialize")
+        }
+        Log.i(TAG, "Using ${if (supportsUnprocessed) "unprocessed" else "voice-recognition"} audio source")
+        return record
+    }
+
+    private fun enableEchoCancellation(record: AudioRecord) {
+        if (!AcousticEchoCanceler.isAvailable()) return
+        try {
+            acousticEchoCanceler = AcousticEchoCanceler.create(record.audioSessionId)?.apply {
+                enabled = true
+                Log.i(TAG, "Acoustic echo cancellation enabled")
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start VadEngine", e)
-            stop()
+            Log.w(TAG, "Could not enable acoustic echo cancellation", e)
         }
     }
 
     fun stop() {
         isRunning = false
         try {
-            recordingThread?.join(1_000)
-        } catch (e: Exception) {
-            Log.w(TAG, "Interrupted while joining recording thread", e)
-        }
-        recordingThread = null
-
-        try {
             audioRecord?.stop()
         } catch (e: Exception) {
             Log.w(TAG, "Error stopping AudioRecord", e)
         }
-        audioRecord?.release()
+
+        try {
+            recordingThread?.join()
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            Log.w(TAG, "Interrupted while waiting for VAD thread to stop", e)
+        }
+        recordingThread = null
+    }
+
+    private fun cleanup() {
+        try {
+            acousticEchoCanceler?.release()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error releasing AcousticEchoCanceler", e)
+        }
+        acousticEchoCanceler = null
+
+        try {
+            audioRecord?.release()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error releasing AudioRecord", e)
+        }
         audioRecord = null
 
-        ortSession?.close()
+        try {
+            ortSession?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error closing Silero session", e)
+        }
         ortSession = null
-        ortEnv?.close()
-        ortEnv = null
     }
 
     private fun recordingLoop() {
-        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
 
+        val session = ortSession ?: return
+        val env = OrtEnvironment.getEnvironment()
         val pcmBuffer = ShortArray(WINDOW_SIZE)
         val floatBuffer = FloatArray(WINDOW_SIZE)
-        val stateShape = longArrayOf(STATE_LAYERS.toLong(), 1L, STATE_DIM.toLong())
+        val state = FloatArray(STATE_LAYERS * STATE_DIM)
         val inputShape = longArrayOf(1L, WINDOW_SIZE.toLong())
+        val stateShape = longArrayOf(STATE_LAYERS.toLong(), 1L, STATE_DIM.toLong())
+        var speechMillis = 0L
+        var belowThresholdMillis = 0L
         var lastSpeechState = false
+        var frameCounter = 0L
+        var samplesRead = 0
+        var inputGain = 1f
+        var smoothedProbability = 0f
 
-        val env = ortEnv ?: return
-        val session = ortSession ?: return
-
-        // Create constant sample rate tensor once for the entire session
-        val srTensor = OnnxTensor.createTensor(
-            env,
-            LongBuffer.wrap(longArrayOf(SAMPLE_RATE.toLong())),
-            longArrayOf(),
-        )
-
+        var srTensor: OnnxTensor? = null
         try {
+            val sampleRateTensor = OnnxTensor.createTensor(
+                env,
+                LongBuffer.wrap(longArrayOf(SAMPLE_RATE.toLong())),
+                longArrayOf(),
+            )
+            srTensor = sampleRateTensor
             while (isRunning) {
-                var samplesRead = 0
                 val record = audioRecord ?: break
 
-                while (samplesRead < WINDOW_SIZE && isRunning) {
-                    val n = record.read(pcmBuffer, samplesRead, WINDOW_SIZE - samplesRead)
-                    if (n < 0) {
-                        Log.e(TAG, "AudioRecord.read() error: $n")
-                        return
+                val count = record.read(
+                    pcmBuffer,
+                    samplesRead,
+                    WINDOW_SIZE - samplesRead,
+                    AudioRecord.READ_BLOCKING,
+                )
+
+                if (count > 0) {
+                    samplesRead += count
+                } else if (count < 0) {
+                    if (isRunning) {
+                        throw IllegalStateException("Microphone read failed (error $count)")
                     }
-                    if (n > 0) samplesRead += n
+                } else {
+                    Thread.sleep(5)
                 }
+
                 if (!isRunning) break
 
-                // Normalize 16-bit PCM shorts to [-1.0f, 1.0f]
-                for (i in 0 until WINDOW_SIZE) {
-                    floatBuffer[i] = pcmBuffer[i].toFloat() / 32768.0f
+                // Wait until we have accumulated a complete model frame.
+                if (samplesRead < WINDOW_SIZE) {
+                    continue
                 }
 
-                val inputTensor = OnnxTensor.createTensor(
-                    env,
-                    FloatBuffer.wrap(floatBuffer),
-                    inputShape,
+                // Reset accumulator for the next frame
+                samplesRead = 0
+
+                var sumSquares = 0.0
+                for (i in 0 until WINDOW_SIZE) {
+                    val sample = pcmBuffer[i].toFloat() / 32768.0f
+                    floatBuffer[i] = sample
+                    sumSquares += sample * sample
+                }
+                val rms = kotlin.math.sqrt(sumSquares / WINDOW_SIZE).toFloat()
+                onAudioLevelUpdated?.invoke(rms)
+
+                val voicedPeakContrast = periodicSpeechScore(floatBuffer)
+
+                // Adapt quiet microphone input to the model's useful range without gating frames.
+                val desiredGain = (TARGET_MODEL_INPUT_RMS / rms.coerceAtLeast(1e-8f))
+                    .coerceIn(1f, MAX_INPUT_GAIN)
+                val smoothing = if (desiredGain > inputGain) GAIN_ATTACK else GAIN_RELEASE
+                inputGain += smoothing * (desiredGain - inputGain)
+                for (i in floatBuffer.indices) {
+                    floatBuffer[i] = (floatBuffer[i] * inputGain).coerceIn(-1f, 1f)
+                }
+
+                val rawProb = runInference(
+                    session = session,
+                    env = env,
+                    input = floatBuffer,
+                    inputShape = inputShape,
+                    state = state,
+                    stateShape = stateShape,
+                    srTensor = sampleRateTensor,
                 )
-                val stateTensor = OnnxTensor.createTensor(
-                    env,
-                    FloatBuffer.wrap(state),
-                    stateShape,
-                )
 
-                val inputs = mapOf(
-                    "input" to inputTensor,
-                    "state" to stateTensor,
-                    "sr" to srTensor,
-                )
+                val probability = if (rawProb.isNaN() || rawProb.isInfinite()) 0f else rawProb.coerceIn(0f, 1f)
 
-                val results = session.run(inputs)
+                smoothedProbability = maxOf(probability, smoothedProbability * 0.85f)
+                onProbabilityUpdated?.invoke(smoothedProbability)
 
-                val outputTensor = results["output"].get() as OnnxTensor
-                @Suppress("UNCHECKED_CAST")
-                val probability = (outputTensor.value as Array<FloatArray>)[0][0]
+                frameCounter++
+                if (frameCounter % 25L == 0L) {
+                    Log.d(TAG, "Audio frame $frameCounter: micRms=$rms gain=$inputGain probability=$probability")
+                }
 
-                val stateNTensor = results["stateN"].get() as OnnxTensor
-                val sBuf = stateNTensor.floatBuffer
-                sBuf.rewind()
-                sBuf.get(state)
+                val frameMillis = WINDOW_SIZE * 1_000L / SAMPLE_RATE
 
-                inputTensor.close()
-                stateTensor.close()
-                results.close()
+                val loudUnvoicedNoise = !lastSpeechState &&
+                    rms >= LOUD_INPUT_RMS &&
+                    probability < STRONG_SPEECH_PROBABILITY &&
+                    voicedPeakContrast < MIN_VOICED_PEAK_CONTRAST
+                val speechCandidate = probability >= SPEECH_THRESHOLD && !loudUnvoicedNoise
 
-                val isSpeech = probability >= speechThreshold
-                if (isSpeech != lastSpeechState) {
-                    Log.d(TAG, "Speech state changed: $isSpeech (prob=$probability, threshold=$speechThreshold)")
-                    lastSpeechState = isSpeech
-                    onSpeechStateChanged(isSpeech)
+                if (speechCandidate) {
+                    speechMillis += frameMillis
+                    belowThresholdMillis = 0L
+                } else {
+                    speechMillis = 0L
+                    if (lastSpeechState) {
+                        belowThresholdMillis += frameMillis
+                    } else {
+                        belowThresholdMillis = 0L
+                    }
+                }
+
+                val speechDetected = when {
+                    !lastSpeechState && speechMillis >= SPEECH_CONFIRM_MILLIS -> true
+                    lastSpeechState && belowThresholdMillis >= SPEECH_RELEASE_MILLIS -> false
+                    else -> lastSpeechState
+                }
+
+                if (speechDetected != lastSpeechState) {
+                    Log.d(TAG, "Speech state changed: $speechDetected (probability=$probability)")
+                    lastSpeechState = speechDetected
+                    speechMillis = 0L
+                    belowThresholdMillis = 0L
+                    onSpeechStateChanged(speechDetected)
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Recording loop crashed", e)
-        } finally {
-            try {
-                srTensor.close()
-            } catch (e: Exception) {
-                Log.w(TAG, "Error closing srTensor", e)
-            }
+            Log.e(TAG, "Silero inference loop failed", e)
             if (lastSpeechState) {
+                lastSpeechState = false
                 onSpeechStateChanged(false)
             }
+            onError(e.message ?: "Speech detection stopped unexpectedly")
+        } finally {
+            srTensor?.close()
+            if (lastSpeechState) onSpeechStateChanged(false)
+        }
+    }
+
+    private fun periodicSpeechScore(samples: FloatArray): Float {
+        val highPassed = FloatArray(samples.size)
+        var previous = samples[0]
+        for (i in samples.indices) {
+            val current = samples[i]
+            highPassed[i] = current - previous
+            previous = current
+        }
+
+        val correlations = DoubleArray(SAMPLE_RATE / 80 - SAMPLE_RATE / 360 + 1)
+        val minLag = SAMPLE_RATE / 360
+        for (lag in minLag until minLag + correlations.size) {
+            var correlation = 0.0
+            var firstEnergy = 0.0
+            var secondEnergy = 0.0
+            for (i in lag until highPassed.size) {
+                val first = highPassed[i]
+                val second = highPassed[i - lag]
+                correlation += first * second
+                firstEnergy += first * first
+                secondEnergy += second * second
+            }
+            val denominator = kotlin.math.sqrt(firstEnergy * secondEnergy)
+            if (denominator > 1e-12) {
+                correlations[lag - minLag] = correlation / denominator
+            }
+        }
+
+        val peakIndex = correlations.indices.maxByOrNull { correlations[it] } ?: return 0f
+        val peak = correlations[peakIndex]
+        var neighborSum = 0.0
+        var neighborCount = 0
+        for (index in maxOf(0, peakIndex - 5)..minOf(correlations.lastIndex, peakIndex + 5)) {
+            if (kotlin.math.abs(index - peakIndex) > 1) {
+                neighborSum += correlations[index]
+                neighborCount++
+            }
+        }
+        if (neighborCount == 0) return 0f
+        return (peak - neighborSum / neighborCount).toFloat()
+    }
+
+    private fun runInference(
+        session: OrtSession,
+        env: OrtEnvironment,
+        input: FloatArray,
+        inputShape: LongArray,
+        state: FloatArray,
+        stateShape: LongArray,
+        srTensor: OnnxTensor,
+    ): Float {
+        val inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(input), inputShape)
+        val stateTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(state), stateShape)
+        try {
+            val inputs = mapOf(
+                "input" to inputTensor,
+                "state" to stateTensor,
+                "sr" to srTensor,
+            )
+            session.run(inputs).use { results ->
+                val outputTensor = results["output"].get() as? OnnxTensor
+                    ?: error("Silero output is not an ONNX tensor")
+                val output = outputTensor.value as? Array<*>
+                    ?: error("Unexpected Silero output shape")
+                val firstRow = output.firstOrNull() as? FloatArray
+                    ?: error("Silero output did not contain a probability")
+                val probability = firstRow.firstOrNull()
+                    ?: error("Silero output probability is empty")
+
+                val nextStateTensor = results["stateN"].get() as? OnnxTensor
+                    ?: error("Silero recurrent state is not an ONNX tensor")
+                val stateBuffer = nextStateTensor.floatBuffer
+                stateBuffer.rewind()
+                check(stateBuffer.remaining() == state.size) {
+                    "Unexpected Silero recurrent state size: ${stateBuffer.remaining()}"
+                }
+                stateBuffer.get(state)
+                return probability
+            }
+        } finally {
+            inputTensor.close()
+            stateTensor.close()
         }
     }
 }
