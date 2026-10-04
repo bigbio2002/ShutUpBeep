@@ -28,8 +28,13 @@ class VadEngine(
         private const val STATE_DIM = 128
         private const val STATE_LAYERS = 2
         private const val SPEECH_THRESHOLD = 0.10f
-        private const val SPEECH_CONFIRM_MILLIS = 32L
-        private const val SPEECH_RELEASE_MILLIS = 850L
+        private const val ONSET_WINDOW_FRAMES = 8
+        private const val ONSET_REQUIRED_FRAMES = 5
+        private const val SPEECH_RELEASE_MILLIS = 400L
+        private const val IMPULSE_RMS_THRESHOLD = 0.25f
+        private const val IMPULSE_RISE_RATIO = 2.5f
+        private const val IMPULSE_RELEASE_RMS = 0.12f
+        private const val IMPULSE_COOLDOWN_MILLIS = 250L
         private const val TARGET_MODEL_INPUT_RMS = 0.08f
         private const val MAX_INPUT_GAIN = 32f
         private const val GAIN_ATTACK = 0.5f
@@ -191,13 +196,17 @@ class VadEngine(
         val state = FloatArray(STATE_LAYERS * STATE_DIM)
         val inputShape = longArrayOf(1L, WINDOW_SIZE.toLong())
         val stateShape = longArrayOf(STATE_LAYERS.toLong(), 1L, STATE_DIM.toLong())
-        var speechMillis = 0L
+        val onsetHistory = BooleanArray(ONSET_WINDOW_FRAMES)
+        var onsetHistoryIndex = 0
+        var onsetHits = 0
         var belowThresholdMillis = 0L
         var lastSpeechState = false
         var frameCounter = 0L
         var samplesRead = 0
         var inputGain = 1f
         var smoothedProbability = 0f
+        var previousRms = 0f
+        var impulseCooldownMillis = 0L
 
         var srTensor: OnnxTensor? = null
         try {
@@ -246,13 +255,38 @@ class VadEngine(
                 val rms = kotlin.math.sqrt(sumSquares / WINDOW_SIZE).toFloat()
                 onAudioLevelUpdated?.invoke(rms)
 
-                // Adapt quiet microphone input to the model's useful range without gating frames.
-                val desiredGain = (TARGET_MODEL_INPUT_RMS / rms.coerceAtLeast(1e-8f))
-                    .coerceIn(1f, MAX_INPUT_GAIN)
-                val smoothing = if (desiredGain > inputGain) GAIN_ATTACK else GAIN_RELEASE
-                inputGain += smoothing * (desiredGain - inputGain)
-                for (i in floatBuffer.indices) {
-                    floatBuffer[i] = (floatBuffer[i] * inputGain).coerceIn(-1f, 1f)
+                val isLoudImpulse = !lastSpeechState &&
+                    rms >= IMPULSE_RMS_THRESHOLD &&
+                    rms >= previousRms * IMPULSE_RISE_RATIO
+                previousRms = rms
+
+                if (isLoudImpulse) {
+                    impulseCooldownMillis = IMPULSE_COOLDOWN_MILLIS
+                    inputGain = 1f
+                    state.fill(0f)
+                    onsetHistory.fill(false)
+                    onsetHits = 0
+                    Log.d(TAG, "Suppressing abrupt loud microphone transient (rms=$rms)")
+                }
+
+                val suppressTransient = !lastSpeechState && impulseCooldownMillis > 0L
+                if (suppressTransient) {
+                    floatBuffer.fill(0f)
+                    state.fill(0f)
+                    impulseCooldownMillis = if (rms >= IMPULSE_RELEASE_RMS) {
+                        IMPULSE_COOLDOWN_MILLIS
+                    } else {
+                        (impulseCooldownMillis - WINDOW_SIZE * 1_000L / SAMPLE_RATE).coerceAtLeast(0L)
+                    }
+                } else {
+                    // Adapt quiet microphone input to the model's useful range without gating frames.
+                    val desiredGain = (TARGET_MODEL_INPUT_RMS / rms.coerceAtLeast(1e-8f))
+                        .coerceIn(1f, MAX_INPUT_GAIN)
+                    val smoothing = if (desiredGain > inputGain) GAIN_ATTACK else GAIN_RELEASE
+                    inputGain += smoothing * (desiredGain - inputGain)
+                    for (i in floatBuffer.indices) {
+                        floatBuffer[i] = (floatBuffer[i] * inputGain).coerceIn(-1f, 1f)
+                    }
                 }
 
                 val rawProb = runInference(
@@ -277,22 +311,20 @@ class VadEngine(
 
                 val frameMillis = WINDOW_SIZE * 1_000L / SAMPLE_RATE
 
-                val speechCandidate = probability >= SPEECH_THRESHOLD
+                val speechCandidate = probability >= SPEECH_THRESHOLD && !suppressTransient
+                if (onsetHistory[onsetHistoryIndex]) onsetHits--
+                onsetHistory[onsetHistoryIndex] = speechCandidate
+                if (speechCandidate) onsetHits++
+                onsetHistoryIndex = (onsetHistoryIndex + 1) % ONSET_WINDOW_FRAMES
 
                 if (speechCandidate) {
-                    speechMillis += frameMillis
                     belowThresholdMillis = 0L
-                } else {
-                    speechMillis = 0L
-                    if (lastSpeechState) {
-                        belowThresholdMillis += frameMillis
-                    } else {
-                        belowThresholdMillis = 0L
-                    }
+                } else if (lastSpeechState) {
+                    belowThresholdMillis += frameMillis
                 }
 
                 val speechDetected = when {
-                    !lastSpeechState && speechMillis >= SPEECH_CONFIRM_MILLIS -> true
+                    !lastSpeechState && onsetHits >= ONSET_REQUIRED_FRAMES -> true
                     lastSpeechState && belowThresholdMillis >= SPEECH_RELEASE_MILLIS -> false
                     else -> lastSpeechState
                 }
@@ -300,7 +332,6 @@ class VadEngine(
                 if (speechDetected != lastSpeechState) {
                     Log.d(TAG, "Speech state changed: $speechDetected (probability=$probability)")
                     lastSpeechState = speechDetected
-                    speechMillis = 0L
                     belowThresholdMillis = 0L
                     onSpeechStateChanged(speechDetected)
                 }
