@@ -27,17 +27,18 @@ class VadEngine(
         private const val WINDOW_SIZE = 256
         private const val STATE_DIM = 128
         private const val STATE_LAYERS = 2
-        private const val SPEECH_THRESHOLD = 0.10f
+        private const val SPEECH_THRESHOLD = 0.08f
+        private const val STRONG_SPEECH_THRESHOLD = 0.15f
         private const val ONSET_WINDOW_FRAMES = 8
-        private const val ONSET_REQUIRED_FRAMES = 5
+        private const val ONSET_REQUIRED_FRAMES = 2
         private const val SPEECH_RELEASE_MILLIS = 400L
         private const val IMPULSE_RMS_THRESHOLD = 0.25f
         private const val IMPULSE_RISE_RATIO = 2.5f
         private const val IMPULSE_RELEASE_RMS = 0.12f
         private const val IMPULSE_COOLDOWN_MILLIS = 250L
         private const val TARGET_MODEL_INPUT_RMS = 0.08f
-        private const val MAX_INPUT_GAIN = 32f
-        private const val GAIN_ATTACK = 0.5f
+        private const val MAX_INPUT_GAIN = 64f
+        private const val GAIN_ATTACK = 0.8f
         private const val GAIN_RELEASE = 0.15f
     }
 
@@ -324,7 +325,9 @@ class VadEngine(
                 }
 
                 val speechDetected = when {
-                    !lastSpeechState && onsetHits >= ONSET_REQUIRED_FRAMES -> true
+                    !lastSpeechState &&
+                        (onsetHits >= ONSET_REQUIRED_FRAMES ||
+                            (speechCandidate && probability >= STRONG_SPEECH_THRESHOLD)) -> true
                     lastSpeechState && belowThresholdMillis >= SPEECH_RELEASE_MILLIS -> false
                     else -> lastSpeechState
                 }
