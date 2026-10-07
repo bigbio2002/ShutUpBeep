@@ -265,7 +265,7 @@ fun VadScreen(
                                 color = Color(0xFFE0E0E0),
                             )
                             Text(
-                                text = "All frames reach the model; speech confidence drives the trigger.",
+                                text = "Keeps listening in the background. Use the ongoing notification to stop detection.",
                                 fontSize = 11.sp,
                                 color = Color(0xFF757575),
                             )

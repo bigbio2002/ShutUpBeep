@@ -2,6 +2,7 @@ package com.example.shutupbeep
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -11,13 +12,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Scaffold
-import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.shutupbeep.ui.theme.ShutUpBeepTheme
 
@@ -29,45 +25,32 @@ class MainActivity : ComponentActivity() {
             ShutUpBeepTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     val vm: VadViewModel = viewModel()
-                    val lifecycleOwner = LocalLifecycleOwner.current
 
-                    val permissionLauncher = rememberLauncherForActivityResult(
+                    val notificationPermissionLauncher = rememberLauncherForActivityResult(
                         contract = ActivityResultContracts.RequestPermission(),
-                    ) { granted ->
-                        if (granted) vm.onPermissionGranted()
-                        else vm.onPermissionDenied()
+                    ) {
+                        vm.onPermissionGranted()
                     }
 
-                    // Auto-start listening if permission was already granted
-                    LaunchedEffect(Unit) {
-                        val hasPermission = ContextCompat.checkSelfPermission(
-                            this@MainActivity,
-                            Manifest.permission.RECORD_AUDIO,
-                        ) == PackageManager.PERMISSION_GRANTED
-
-                        if (hasPermission) {
+                    val startAfterNotificationPermission: () -> Unit = {
+                        if (
+                            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                            ContextCompat.checkSelfPermission(
+                                this@MainActivity,
+                                Manifest.permission.POST_NOTIFICATIONS,
+                            ) != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        } else {
                             vm.onPermissionGranted()
                         }
                     }
 
-                    DisposableEffect(lifecycleOwner) {
-                        val observer = LifecycleEventObserver { _, event ->
-                            if (event == Lifecycle.Event.ON_STOP) {
-                                vm.stopListening()
-                            } else if (event == Lifecycle.Event.ON_START) {
-                                val hasPermission = ContextCompat.checkSelfPermission(
-                                    this@MainActivity,
-                                    Manifest.permission.RECORD_AUDIO,
-                                ) == PackageManager.PERMISSION_GRANTED
-                                if (hasPermission && (vm.status.value == AppStatus.IDLE)) {
-                                    vm.onPermissionGranted()
-                                }
-                            }
-                        }
-                        lifecycleOwner.lifecycle.addObserver(observer)
-                        onDispose {
-                            lifecycleOwner.lifecycle.removeObserver(observer)
-                        }
+                    val permissionLauncher = rememberLauncherForActivityResult(
+                        contract = ActivityResultContracts.RequestPermission(),
+                    ) { granted ->
+                        if (granted) startAfterNotificationPermission()
+                        else vm.onPermissionDenied()
                     }
 
                     VadScreen(
@@ -78,7 +61,7 @@ class MainActivity : ComponentActivity() {
                             ) == PackageManager.PERMISSION_GRANTED
 
                             if (hasPermission) {
-                                vm.onPermissionGranted()
+                                startAfterNotificationPermission()
                             } else {
                                 permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                             }
